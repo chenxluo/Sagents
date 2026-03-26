@@ -1,0 +1,19 @@
+developer:
+  provider: "anthropic"
+  model: "claude-sonnet-4-20250514"
+  api_key: "${ANTHROPIC_API_KEY}"
+
+qa:
+  provider: "openai"
+  model: "gpt-4"
+  api_key: "${OPENAI_API_KEY}"
+
+tech_writer:
+  provider: "anthropic"
+  model: "claude-haiku"
+  api_key: "${ANTHROPIC_API_KEY}"
+
+orchestrator:
+  provider: "anthropic"
+  model: "claude-sonnet-4-20250514"
+  api_key: "${ANTHROPIC_API_KEY}"
