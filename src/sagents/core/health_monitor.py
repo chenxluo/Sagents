@@ -4,6 +4,10 @@ import logging
 import time
 from typing import Optional
 from collections import defaultdict, deque
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+import aiosqlite
 
 from .state import AgentType, HealthLevel
 
@@ -87,11 +91,104 @@ class AgentHealthStats:
 class HealthMonitor:
     """健康度监控器"""
     
-    def __init__(self):
+    def __init__(self, db_path: Optional[str] = None):
         self._stats: dict[AgentType, AgentHealthStats] = {}
         self._global_failure_rate: float = 0.0
         self._paused: bool = False
         self._lock: asyncio.Lock = asyncio.Lock()
+        self._db_path = db_path or "./health_monitor.db"
+        self._db: Optional[aiosqlite.Connection] = None
+        self._initialized: bool = False
+    
+    async def initialize(self):
+        """初始化数据库"""
+        if self._initialized:
+            return
+        
+        await self._init_db()
+        await self._load_from_db()
+        self._initialized = True
+    
+    async def _init_db(self):
+        """初始化数据库表"""
+        self._db = await aiosqlite.connect(self._db_path)
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS health_stats (
+                agent_type TEXT PRIMARY KEY,
+                total_tasks INTEGER DEFAULT 0,
+                success_tasks INTEGER DEFAULT 0,
+                failed_tasks INTEGER DEFAULT 0,
+                timeouts INTEGER DEFAULT 0,
+                last_updated REAL
+            )
+        """)
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS health_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_type TEXT,
+                event_type TEXT,
+                error TEXT,
+                timestamp REAL
+            )
+        """)
+        await self._db.commit()
+        logger.info(f"Health monitor DB initialized: {self._db_path}")
+    
+    async def _load_from_db(self):
+        """从数据库加载状态"""
+        async with self._db.execute("SELECT * FROM health_stats") as cursor:
+            rows = await cursor.fetchall()
+            for row in rows:
+                agent_type_str, total, success, failed, timeouts, last_updated = row
+                agent_type = AgentType(agent_type_str)
+                stats = AgentHealthStats(agent_type)
+                stats.total_tasks = total
+                stats.success_tasks = success
+                stats.failed_tasks = failed
+                stats.timeouts = timeouts
+                stats.last_updated = last_updated or time.time()
+                self._stats[agent_type] = stats
+                self._update_global_rate()
+    
+    async def _save_stats(self, agent_type: AgentType):
+        """保存统计到数据库"""
+        if not self._db:
+            return
+        
+        stats = self._stats.get(agent_type)
+        if not stats:
+            return
+        
+        await self._db.execute("""
+            INSERT OR REPLACE INTO health_stats 
+            (agent_type, total_tasks, success_tasks, failed_tasks, timeouts, last_updated)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            agent_type.value,
+            stats.total_tasks,
+            stats.success_tasks,
+            stats.failed_tasks,
+            stats.timeouts,
+            stats.last_updated,
+        ))
+        await self._db.commit()
+    
+    async def _save_event(self, agent_type: AgentType, event_type: str, error: Optional[str] = None):
+        """保存事件到数据库"""
+        if not self._db:
+            return
+        
+        await self._db.execute("""
+            INSERT INTO health_events (agent_type, event_type, error, timestamp)
+            VALUES (?, ?, ?, ?)
+        """, (agent_type.value, event_type, error, time.time()))
+        await self._db.commit()
+    
+    async def close(self):
+        """关闭数据库连接"""
+        if self._db:
+            await self._db.close()
+            self._db = None
     
     def get_or_create_stats(self, agent_type: AgentType) -> AgentHealthStats:
         """获取或创建统计"""
@@ -105,6 +202,11 @@ class HealthMonitor:
             stats = self.get_or_create_stats(agent_type)
             stats.record_success()
             self._update_global_rate()
+            
+            # 保存到数据库
+            await self._save_stats(agent_type)
+            await self._save_event(agent_type, "success")
+            
             logger.info(f"[{agent_type.value}] Success recorded. Rate: {stats.success_rate:.2%}")
     
     async def record_failure(self, agent_type: AgentType, error: Optional[str] = None):
@@ -113,6 +215,10 @@ class HealthMonitor:
             stats = self.get_or_create_stats(agent_type)
             stats.record_failure(error)
             self._update_global_rate()
+            
+            # 保存到数据库
+            await self._save_stats(agent_type)
+            await self._save_event(agent_type, "failure", error)
             
             level = stats.get_health_level()
             if level == HealthLevel.CRITICAL:
@@ -126,6 +232,11 @@ class HealthMonitor:
             stats = self.get_or_create_stats(agent_type)
             stats.record_timeout()
             self._update_global_rate()
+            
+            # 保存到数据库
+            await self._save_stats(agent_type)
+            await self._save_event(agent_type, "timeout")
+            
             logger.warning(f"[{agent_type.value}] Timeout recorded")
     
     def _update_global_rate(self):
@@ -183,15 +294,40 @@ class HealthMonitor:
             "is_paused": self.is_paused(),
             "agent_stats": self.get_all_stats(),
         }
+    
+    async def get_history(self, agent_type: AgentType, limit: int = 100) -> list[dict]:
+        """获取历史事件"""
+        if not self._db:
+            return []
+        
+        async with self._db.execute("""
+            SELECT event_type, error, timestamp 
+            FROM health_events 
+            WHERE agent_type = ?
+            ORDER BY timestamp DESC
+            LIMIT ?
+        """, (agent_type.value, limit)) as cursor:
+            rows = await cursor.fetchall()
+            return [
+                {"type": row[0], "error": row[1], "timestamp": row[2]}
+                for row in rows
+            ]
 
 
 # 全局健康监控实例
 _health_monitor: Optional[HealthMonitor] = None
 
 
-def get_health_monitor() -> HealthMonitor:
+def get_health_monitor(db_path: Optional[str] = None) -> HealthMonitor:
     """获取健康监控实例"""
     global _health_monitor
     if _health_monitor is None:
-        _health_monitor = HealthMonitor()
+        _health_monitor = HealthMonitor(db_path=db_path)
     return _health_monitor
+
+
+async def initialize_health_monitor(db_path: Optional[str] = None) -> HealthMonitor:
+    """初始化并返回健康监控实例"""
+    monitor = get_health_monitor(db_path=db_path)
+    await monitor.initialize()
+    return monitor

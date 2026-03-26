@@ -7,6 +7,7 @@ from .state import AgentType, Task, TaskStatus, AgentMessage, InvokeMode
 from .message_bus import MessageBus, MessageBusRegistry
 from .health_monitor import HealthMonitor, get_health_monitor
 from .config import get_config
+from ..tools.github_tool import GitHubTool
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +19,7 @@ class Orchestrator:
         self,
         message_bus: Optional[MessageBus] = None,
         health_monitor: Optional[HealthMonitor] = None,
+        github_token: Optional[str] = None,
     ):
         self.message_bus = message_bus or MessageBusRegistry.get()
         self.health_monitor = health_monitor or get_health_monitor()
@@ -26,6 +28,9 @@ class Orchestrator:
         self._running = False
         self._task_queue: asyncio.Queue = asyncio.Queue()
         self._active_tasks: dict[str, Task] = {}
+        
+        # GitHub 集成
+        self.github_tool = GitHubTool(token=github_token) if github_token else None
     
     async def start(self):
         """启动协调者"""
@@ -134,35 +139,116 @@ class Orchestrator:
         }
         return mapping.get(agent_type)
     
-    async def merge_pr(self, pr_url: str) -> bool:
+    async def merge_pr(
+        self,
+        owner: str,
+        repo: str,
+        pr_number: int,
+        merge_method: str = "squash",
+    ) -> dict:
         """
         合并 PR
         
         Args:
-            pr_url: PR URL
+            owner: 仓库所有者
+            repo: 仓库名
+            pr_number: PR 编号
+            merge_method: 合并方式 (squash, merge, rebase)
         
         Returns:
-            是否成功
+            合并结果
         """
-        logger.info(f"Merging PR: {pr_url}")
-        # 这里会调用 GitHub API
-        # TODO: 实现 GitHub API 调用
-        return True
+        logger.info(f"Merging PR #{pr_number} in {owner}/{repo}")
+        
+        if not self.github_tool:
+            logger.warning("GitHub tool not initialized")
+            return {"status": "failed", "error": "GitHub tool not initialized"}
+        
+        try:
+            result = await self.github_tool.merge_pull_request(
+                owner=owner,
+                repo=repo,
+                pr_number=pr_number,
+                merge_method=merge_method,
+            )
+            logger.info(f"PR #{pr_number} merged successfully")
+            return result
+        except Exception as e:
+            logger.error(f"Failed to merge PR: {e}")
+            return {"status": "failed", "error": str(e)}
     
-    async def create_branch(self, branch_name: str, base: str = "main") -> bool:
+    async def create_branch(
+        self,
+        owner: str,
+        repo: str,
+        branch_name: str,
+        base: str = "main",
+    ) -> dict:
         """
         创建分支
         
         Args:
+            owner: 仓库所有者
+            repo: 仓库名
             branch_name: 分支名
             base: 基础分支
         
         Returns:
-            是否成功
+            创建结果
         """
-        logger.info(f"Creating branch: {branch_name} from {base}")
-        # TODO: 实现 GitHub API 调用
-        return True
+        logger.info(f"Creating branch: {branch_name} from {base} in {owner}/{repo}")
+        
+        if not self.github_tool:
+            logger.warning("GitHub tool not initialized")
+            return {"status": "failed", "error": "GitHub tool not initialized"}
+        
+        try:
+            result = await self.github_tool.create_branch(
+                owner=owner,
+                repo=repo,
+                branch_name=branch_name,
+                base_branch=base,
+            )
+            logger.info(f"Branch {branch_name} created successfully")
+            return result
+        except Exception as e:
+            logger.error(f"Failed to create branch: {e}")
+            return {"status": "failed", "error": str(e)}
+    
+    async def handle_webhook(self, event: dict) -> dict:
+        """
+        处理 webhook 事件
+        
+        Args:
+            event: webhook 事件数据
+        
+        Returns:
+            处理结果
+        """
+        event_type = event.get("type")
+        action = event.get("action")
+        
+        logger.info(f"Handling webhook: {event_type} - {action}")
+        
+        if event_type == "pull_request":
+            if action == "closed" and event.get("pull_request", {}).get("merged"):
+                # PR 被合并
+                pr = event["pull_request"]
+                return {
+                    "status": "pr_merged",
+                    "pr_number": pr.get("number"),
+                    "merged_by": pr.get("merged_by", {}).get("login"),
+                }
+            elif action == "opened":
+                # 新 PR
+                pr = event["pull_request"]
+                return {
+                    "status": "pr_opened",
+                    "pr_number": pr.get("number"),
+                    "author": pr.get("user", {}).get("login"),
+                }
+        
+        return {"status": "ignored"}
     
     async def notify_completion(self, agent_type: AgentType, task: Task):
         """通知任务完成"""

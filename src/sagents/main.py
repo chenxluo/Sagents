@@ -83,6 +83,13 @@ async def status():
     return {
         "status": "running",
         "health": get_health_monitor().get_summary(),
+        "agents": {
+            "orchestrator": "running",
+            "developer": "available",
+            "qa_engineer": "available",
+            "tech_writer": "available",
+        },
+        "version": "0.1.0",
     }
 
 

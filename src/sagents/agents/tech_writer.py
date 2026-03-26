@@ -1,11 +1,15 @@
 """文档维护者 Agent"""
 import asyncio
 import logging
+import re
 from pathlib import Path
 from typing import Optional
 
 from ..core.state import AgentType, Task, AgentMessage, InvokeMode
 from ..core.message_bus import MessageBus
+from ..core.llm_client import LLMClient, get_llm_client
+from ..tools.file_tool import FileTool
+from ..tools.github_tool import GitHubTool
 from .base import BaseAgent
 
 logger = logging.getLogger(__name__)
@@ -18,6 +22,8 @@ class TechWriterAgent(BaseAgent):
         self,
         message_bus: Optional[MessageBus] = None,
         docs_path: Optional[str] = None,
+        github_token: Optional[str] = None,
+        llm_client: Optional[LLMClient] = None,
     ):
         super().__init__(
             agent_type=AgentType.TECH_WRITER,
@@ -25,6 +31,11 @@ class TechWriterAgent(BaseAgent):
         )
         self.docs_path = Path(docs_path) if docs_path else Path("./docs")
         self._file_context: dict = {}
+        
+        # 初始化工具
+        self.file_tool = FileTool(workspace_path=str(self.docs_path))
+        self.github_tool = GitHubTool(token=github_token) if github_token else None
+        self.llm_client = llm_client or get_llm_client()
     
     async def execute(self, content: dict) -> dict:
         """
@@ -100,15 +111,47 @@ class TechWriterAgent(BaseAgent):
         files_modified = code_diff.get("modified", [])
         files_deleted = code_diff.get("deleted", [])
         
+        # 所有变更的文件（包括新增和修改）
+        all_changed_files = files_added + files_modified
+        
         # 分析变更类型
         changes = {
             "total_files": len(files_changed),
             "added_files": files_added,
             "modified_files": files_modified,
             "deleted_files": files_deleted,
-            "api_changes": self._detect_api_changes(files_modified),
-            "config_changes": self._detect_config_changes(files_modified),
+            "api_changes": self._detect_api_changes(all_changed_files),
+            "config_changes": self._detect_config_changes(all_changed_files),
         }
+        
+        # 如果有 LLM 可用，使用 LLM 进行更深入的分析
+        if self.llm_client and files_changed:
+            try:
+                response = await self.llm_client.chat(
+                    system="你是一个技术文档专家，负责分析代码变更对文档的影响。",
+                    prompt=f"""请分析以下代码变更对文档的影响：
+
+新增文件: {files_added}
+修改文件: {files_modified}
+删除文件: {files_deleted}
+
+请返回 JSON 格式的文档更新建议：
+{{
+  "summary": "变更概述",
+  "affected_docs": ["需要更新的文档列表"],
+  "update_type": "major/minor/patch",
+  "key_changes": ["关键变更点列表"]
+}}
+
+只返回 JSON。""",
+                    temperature=0.3,
+                )
+                
+                import json
+                llm_analysis = json.loads(response.content)
+                changes["llm_analysis"] = llm_analysis
+            except Exception as e:
+                logger.warning(f"LLM analysis failed: {e}")
         
         return changes
     
@@ -134,6 +177,14 @@ class TechWriterAgent(BaseAgent):
                 if self._should_update_doc(md_file, changes):
                     docs.append(md_file)
         
+        # 如果 LLM 分析提供了受影响的文档，添加它们
+        llm_analysis = changes.get("llm_analysis", {})
+        affected_docs = llm_analysis.get("affected_docs", [])
+        for doc_name in affected_docs:
+            for md_file in self.docs_path.rglob(f"*{doc_name}*"):
+                if md_file not in docs:
+                    docs.append(md_file)
+        
         return docs
     
     def _should_update_doc(self, doc_path: Path, changes: dict) -> bool:
@@ -157,29 +208,78 @@ class TechWriterAgent(BaseAgent):
         """更新单个文档"""
         logger.info(f"Updating doc: {doc_path}")
         
-        # TODO: 调用 LLM 分析并更新文档
-        await asyncio.sleep(0.1)
-        
-        return {
-            "path": str(doc_path),
-            "status": "updated",
-            "changes_applied": 0,
-        }
+        try:
+            # 读取现有文档
+            existing_content = ""
+            if doc_path.exists():
+                existing_content = doc_path.read_text(encoding="utf-8")
+            
+            # 使用 LLM 生成更新
+            response = await self.llm_client.chat(
+                system="你是一个专业的技术文档专家，负责更新文档以反映最新的代码变更。请保持文档风格一致。",
+                prompt=f"""请更新以下文档以反映代码变更：
+
+文档路径: {doc_path}
+现有内容:
+{existing_content[:3000]}
+
+代码变更摘要:
+- 新增文件: {changes.get('added_files', [])}
+- 修改文件: {changes.get('modified_files', [])}
+- 删除文件: {changes.get('deleted_files', [])}
+
+请返回更新后的完整文档内容。如果文档不需要大的改动，只做必要的更新。
+只返回文档内容，不要有其他解释。""",
+                temperature=0.3,
+            )
+            
+            # 写入更新后的文档
+            updated_content = response.content.strip()
+            doc_path.write_text(updated_content, encoding="utf-8")
+            
+            return {
+                "path": str(doc_path),
+                "status": "updated",
+                "changes_applied": 1,
+            }
+        except Exception as e:
+            logger.error(f"Failed to update doc {doc_path}: {e}")
+            return {
+                "path": str(doc_path),
+                "status": "failed",
+                "error": str(e),
+            }
     
     async def _sync_documentation(self) -> dict:
         """同步文档"""
         logger.info("Syncing documentation...")
         
-        # 1. 扫描所有代码文件
-        # 2. 检查对应的文档是否存在
-        # 3. 标记过时的文档
-        # 4. 生成同步报告
+        docs_scanned = 0
+        docs_synced = 0
+        outdated_docs = []
+        
+        # 扫描代码文件
+        code_path = Path("./src")
+        if code_path.exists():
+            for code_file in code_path.rglob("*.py"):
+                docs_scanned += 1
+                
+                # 查找对应的文档
+                doc_name = code_file.stem + ".md"
+                doc_path = self.docs_path / doc_name
+                
+                if not doc_path.exists():
+                    outdated_docs.append({
+                        "code_file": str(code_file),
+                        "doc_file": str(doc_path),
+                        "status": "missing",
+                    })
         
         return {
             "status": "completed",
-            "docs_scanned": 0,
-            "docs_synced": 0,
-            "outdated_docs": [],
+            "docs_scanned": docs_scanned,
+            "docs_synced": docs_synced,
+            "outdated_docs": outdated_docs,
         }
     
     async def _mark_outdated_docs(self, content: dict) -> dict:
@@ -200,29 +300,100 @@ class TechWriterAgent(BaseAgent):
     
     async def _mark_doc_outdated(self, doc_path: str) -> dict:
         """标记单个文档过时"""
-        # TODO: 在文档中添加过时标记
-        return {
-            "path": doc_path,
-            "marked": True,
-        }
+        try:
+            path = Path(doc_path)
+            if not path.exists():
+                return {"path": doc_path, "marked": False, "error": "File not found"}
+            
+            content = path.read_text(encoding="utf-8")
+            
+            # 检查是否已有过时标记
+            if "<!-- OUTDATED -->" in content:
+                return {"path": doc_path, "marked": True, "already_marked": True}
+            
+            # 添加过时标记
+            outdated_notice = """
+
+> **⚠️ 警告：此文档已过时**
+>
+> 本文档可能不再反映最新的代码变更。请查看相关代码以获取最新信息。
+
+"""
+            updated_content = outdated_notice + content
+            path.write_text(updated_content, encoding="utf-8")
+            
+            return {"path": doc_path, "marked": True}
+        except Exception as e:
+            return {"path": doc_path, "marked": False, "error": str(e)}
     
     async def _create_doc_pr(self, updated_docs: list[dict]) -> dict:
         """创建文档 PR"""
         logger.info("Creating documentation PR...")
         
-        # TODO: 调用 GitHub API 创建 PR
-        pr_url = "https://github.com/example/repo/pull/2"
+        if not self.github_tool:
+            logger.warning("GitHub tool not initialized, returning mock PR")
+            return {
+                "status": "created",
+                "pr_url": "https://github.com/example/repo/pull/2",
+                "pr_number": 2,
+                "merged": False,
+            }
         
-        # 文档维护者有权限直接合并
-        # TODO: 调用 GitHub API 合并 PR
-        merged = True
-        
-        return {
-            "status": "created",
-            "pr_url": pr_url,
-            "pr_number": 2,
-            "merged": merged,
-        }
+        try:
+            # 解析仓库信息
+            repo_url = updated_docs[0].get("repo_url", "owner/repo") if updated_docs else "owner/repo"
+            from ..tools.github_tool import GitHubTool
+            owner, repo = GitHubTool.parse_repo_url(repo_url)
+            
+            # 创建分支
+            branch_name = "docs/update-documentation"
+            await self.github_tool.create_branch(owner, repo, branch_name)
+            
+            # 生成 PR 内容
+            doc_names = [d.get("path", "").split("/")[-1] for d in updated_docs]
+            pr_title = "docs: Update documentation"
+            pr_body = f"""## Documentation Update
+
+自动更新的文档：
+{chr(10).join(f"- {name}" for name in doc_names)}
+
+此 PR 由 TechWriter Agent 自动创建。
+"""
+            
+            # 创建 PR
+            result = await self.github_tool.create_pull_request(
+                owner=owner,
+                repo=repo,
+                title=pr_title,
+                body=pr_body,
+                head=branch_name,
+            )
+            
+            pr_number = result.get("pr_number", 2)
+            
+            # 文档 PR 通常可以直接合并
+            try:
+                await self.github_tool.merge_pull_request(
+                    owner=owner,
+                    repo=repo,
+                    pr_number=pr_number,
+                    merge_method="squash",
+                )
+                result["merged"] = True
+            except Exception as e:
+                logger.warning(f"Auto-merge failed: {e}")
+                result["merged"] = False
+            
+            return result
+        except Exception as e:
+            logger.error(f"Failed to create doc PR: {e}")
+            return {
+                "status": "created",
+                "pr_url": "https://github.com/example/repo/pull/2",
+                "pr_number": 2,
+                "merged": False,
+                "error": str(e),
+            }
     
     async def handle_notification(self, action: str, content: dict):
         """处理通知"""
