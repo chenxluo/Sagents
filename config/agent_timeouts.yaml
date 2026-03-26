@@ -1,0 +1,23 @@
+developer:
+  max_rounds: 50
+  max_seconds: 3600
+  retry_on_timeout: true
+  max_retries: 2
+
+qa:
+  max_rounds: 30
+  max_seconds: 1800
+  retry_on_timeout: false
+  max_retries: 0
+
+tech_writer:
+  max_rounds: 10
+  max_seconds: 300
+  retry_on_timeout: false
+  max_retries: 0
+
+orchestrator:
+  max_rounds: 100
+  max_seconds: 7200
+  retry_on_timeout: true
+  max_retries: 3
